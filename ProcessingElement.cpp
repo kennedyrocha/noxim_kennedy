@@ -1,0 +1,332 @@
+#include "ProcessingElement.h"
+#include "GlobalParams.h"
+#include <unistd.h>
+#include <iostream>     // std::cout
+#include <vector>       // std::vector, std::begin, std::end
+
+#define HEART_BEAT   10000000
+#define BLOCKING     false
+#define PROCTIME     false
+#define BARRIER      false
+#define STEP_FORWARD false
+
+inline bool ProcessingElement::check_heart_beat(){
+	// ~ 64-bit integer division                    25 cycles
+	// ~ 32-bit integer division (constant)         2+ cycles
+        // ~ 32-bit integer division                    8 cycles
+        // ~ 32-bit integer division via 64-bit float   4 cycles
+        unsigned long long int now = sc_time_stamp().to_double()/GlobalParams::clock_period_ps;
+        return ((now % HEART_BEAT) == 0);
+}
+
+bool ProcessingElement::hasFlitsInQueue(){
+    for (int i = 0; i < GlobalParams::mesh_dim_x * GlobalParams::mesh_dim_y; i++)
+        if(GlobalParams::flits_queue[i] > 0)
+            return true;
+    return false;
+}
+
+inline bool ProcessingElement::mustStop(){
+
+	
+
+    for(int i=0; i < GlobalParams::mesh_dim_x * GlobalParams::mesh_dim_y ; i++){
+        
+        //~ Packet in queue
+        if(!GlobalParams::trace_eof[i]){
+	    if(check_heart_beat()){ 
+	      cout    << "[" <<  sc_time_stamp() << "] PE" <<  setw(2) << local_id << "Don't stop! The cause is trace_eof["<< i <<"]" << endl;
+	    }
+
+            return false;
+	}
+            
+        //~ Finalized matrix
+        for(int j=0; j < GlobalParams::mesh_dim_x * GlobalParams::mesh_dim_y ; j++)
+            if(GlobalParams::finalized[i][j] > 0){
+		if(check_heart_beat())
+		    cout << "[" <<  sc_time_stamp() << "] " <<  setw(3) << local_id << " Don't stop! Finalized[" << i << "][" << j <<"] = " << GlobalParams::finalized[i][j] << endl; 
+                return false;
+	    }
+                
+        //~ Has Barrier
+        if(GlobalParams::hasBarrier[i]){
+		if(check_heart_beat())
+			cout << "[" <<  sc_time_stamp() << "] " <<  setw(3) << local_id << " Don't stop! hasBarrier[" << i << "] = " << GlobalParams::hasBarrier[i] << endl;
+		return false;
+	}
+    }
+    return true;
+}
+
+bool ProcessingElement::check_blocked(int local_id){
+    unsigned long long int now = sc_time_stamp().to_double() / GlobalParams::clock_period_ps;
+    if(GlobalParams::blocked[local_id] && (now - blocked_at) > 1000000000){
+        GlobalParams::blocked[local_id]=false; // set timeout to blocking: 1 second
+        cout << "[" <<  sc_time_stamp() << "] " <<  setw(3) << local_id
+            << " \t\t Unblocked by timeout" << endl;
+    }
+    return GlobalParams::blocked[local_id];
+}
+
+bool ProcessingElement::check_barrier(int local_id){
+
+	assert(GlobalParams::hasBarrier[local_id] && "The check_barrier should be invoked only if hasBarrier flag is true");
+
+	ProcessingElement::barrierCheckCounter++;
+	unsigned long long int threshold = GlobalParams::mesh_dim_x * GlobalParams::mesh_dim_y, i;	
+	assert(GlobalParams::barrier >= 0 && GlobalParams::barrier <= threshold);
+
+	if(GlobalParams::barrier == threshold){
+		for(i=0; i<threshold; i++){
+			GlobalParams::hasBarrier[i] = false;
+			GlobalParams::barrier = 0;
+			ProcessingElement::barrierCheckCounter=0;			
+		}
+		return false;
+	}
+	assert(ProcessingElement::barrierCheckCounter < 1000000000  && "BARRIER Inconsistent. Check Workload!");
+	return true;
+	
+}
+
+bool ProcessingElement::check_processing(int local_id){
+    if(GlobalParams::proctime[local_id] > 0){
+        GlobalParams::proctime[local_id]--;
+        return true;
+    }
+    return false;
+}
+
+bool ProcessingElement::isCollective( mpi_primitive_t primitive ){
+    if( primitive == MPI_ALLGATHER
+     || primitive == MPI_ALLGATHERV
+     || primitive == MPI_ALLREDUCE
+     || primitive == MPI_ALLTOALL
+     || primitive == MPI_ALLTOALLV
+     || primitive == MPI_REDUCE
+     || primitive == MPI_BCAST
+     || primitive == MPI_GATHERV
+     || primitive == MPI_GATHER     )
+        return true;
+    return false;
+}
+
+bool ProcessingElement::isBarrier( mpi_primitive_t primitive ){
+    if( primitive == MPI_BARRIER  )
+        return true;
+    return false;
+}
+
+bool ProcessingElement::isSend( mpi_primitive_t primitive ){
+    if( primitive == MPI_SEND || primitive == MPI_ISEND)
+        return true;
+    return false;
+}
+
+void ProcessingElement::rxProcess()
+{
+    if (reset.read()) {
+        ack_rx.write(0);
+        current_level_rx = 0;
+    } else{
+
+        if(check_heart_beat()){
+            cout    << "[" <<  sc_time_stamp() << "] PE" <<  setw(2) << local_id
+                    << "\tProctime["<< setw(2) << local_id <<"]: " << setw(12)  << GlobalParams::proctime[local_id]
+                    << "\tStep_forward: " << setw(12)  << GlobalParams::proctime_step_forward
+                    << "\tBlocked[" << setw(2) << local_id << "]: " << GlobalParams::blocked[local_id]
+                    << "\t\tBarrier: " << GlobalParams::barrier
+                    << "\tFlits_queue["<< setw(2) << local_id <<"]: " << GlobalParams::flits_queue[local_id]
+                    << "\tPacket_queue["<< setw(2) << local_id <<"]: " << GlobalParams::packet_queue[local_id]
+                    << "\tTrace_eof["<< setw(2) << local_id <<"]: " << GlobalParams::trace_eof[local_id]
+                    << endl;
+        }
+        
+	//~ Check condition to STOP the simulation at every cicle
+	if(!GlobalParams::stop_simulation && traffic_trace->isEmpty() && mustStop()){
+		GlobalParams::stop_simulation = true;
+		cout << "[" <<  sc_time_stamp() << "] " <<  setw(3) << local_id << " Stop!" << endl;
+		sc_stop();
+	}       
+
+        if(STEP_FORWARD && GlobalParams::proctime[local_id] > 0 && !hasFlitsInQueue()){
+                unsigned long long int minor_proctime = GlobalParams::proctime[local_id];
+                for (int i = 0; i < GlobalParams::mesh_dim_x * GlobalParams::mesh_dim_y; i++) {
+                    minor_proctime = (GlobalParams::proctime[i] < minor_proctime) ? GlobalParams::proctime[i] : minor_proctime;
+                }
+
+                for (int i = 0; i < GlobalParams::mesh_dim_x * GlobalParams::mesh_dim_y; i++){
+                    assert(GlobalParams::proctime[i] >= minor_proctime  && "Invalid processing time");
+                    GlobalParams::proctime[i] -= minor_proctime;
+                }
+                GlobalParams::proctime_step_forward +=  minor_proctime;
+                //cout << "Fast-forward (cycles): " << GlobalParams::proctime_step_forward << endl;
+        }
+
+        if (req_rx.read() == 1 - current_level_rx) {
+            Flit flit_tmp = flit_rx.read();
+            current_level_rx = 1 - current_level_rx;    // Negate the old value for Alternating Bit Protocol (ABP)
+		
+            //~ if(STEP_FORWARD) // Usado para o step forward
+                GlobalParams::flits_queue[flit_tmp.src_id]--;
+
+            if(flit_tmp.flit_type == FLIT_TYPE_HEAD){
+
+                if(BLOCKING && isSend(flit_tmp.primitive) ){ //A T E N Ç Ã O: If is sync send!!!
+                    GlobalParams::blocked[flit_tmp.src_id]=false;
+                    blocked_at = 0;
+                }
+            }
+        }
+        ack_rx.write(current_level_rx); 
+
+
+         //~ Check condition to STOP the simulation at every cicle
+         if(!GlobalParams::stop_simulation && traffic_trace->isEmpty() && mustStop()){
+                 GlobalParams::stop_simulation = true;
+                 cout << "[" <<  sc_time_stamp() << "] " <<  setw(3) << local_id << " Stop!" << endl;
+                 sc_stop();
+         }
+    }
+}
+
+void ProcessingElement::txProcess()
+{
+    if (reset.read()) {
+        req_tx.write(0);
+        current_level_tx = 0;
+        transmittedAtPreviousCycle = false;
+    } else {
+        Packet packet;
+        if (canShot(packet)) {
+            packet_queue.push(packet);
+            transmittedAtPreviousCycle = true;
+        } else
+            transmittedAtPreviousCycle = false;
+
+		bool isBlocked = (BLOCKING && GlobalParams::blocked[local_id]) ? true : false;
+        if (ack_tx.read() == current_level_tx && !packet_queue.empty() && !isBlocked) {
+							
+			Flit flit = nextFlit(); // Generate a new flit
+
+			flit_tx->write(flit);   // Send the generated flit
+			current_level_tx = 1 - current_level_tx;    // Negate the old value for Alternating Bit Protocol (ABP)
+			req_tx.write(current_level_tx);
+
+			//~ if(STEP_FORWARD) // Usado para o step forward
+				GlobalParams::flits_queue[local_id]++;
+
+			// Update finalized MATRIX
+			GlobalParams::finalized[flit.src_id][flit.dst_id]++;
+
+			if(flit.flit_type == FLIT_TYPE_HEAD){
+
+				if(BLOCKING && isSend(flit.primitive)) {
+					GlobalParams::blocked[local_id] = true;
+					blocked_at = sc_time_stamp().value() / GlobalParams::clock_period_ps;
+					ProcessingElement::immediate = (flit.primitive == MPI_ISEND);
+				}
+
+			}else if(flit.flit_type == FLIT_TYPE_TAIL){
+				GlobalParams::packet_queue[local_id]--;
+			}
+        }
+    }
+}
+
+
+Flit ProcessingElement::nextFlit()
+{
+    Flit flit;
+    Packet packet = packet_queue.front();
+
+    flit.src_id = packet.src_id;
+    flit.dst_id = packet.dst_id;
+    flit.timestamp = packet.timestamp;
+    flit.sequence_no = packet.size - packet.flit_left;
+    flit.sequence_length = packet.size;
+    flit.hop_no = 0;
+    //  flit.payload     = DEFAULT_PAYLOAD;
+
+    flit.ts_start       = packet.ts_start;
+    flit.ts_end         = packet.ts_end;
+    flit.primitive  = packet.primitive;
+
+
+    if (packet.size == packet.flit_left)
+    flit.flit_type = FLIT_TYPE_HEAD;
+    else if (packet.flit_left == 1)
+    flit.flit_type = FLIT_TYPE_TAIL;
+    else
+    flit.flit_type = FLIT_TYPE_BODY;
+
+    packet_queue.front().flit_left--;
+    if (packet_queue.front().flit_left == 0)
+        packet_queue.pop();
+
+    return flit;
+}
+bool ProcessingElement::canShot(Packet & packet)
+{
+
+    bool isBlocked  = (BLOCKING) ? check_blocked(local_id) : false;
+   
+    if(isBlocked && !ProcessingElement::immediate)
+		return false;
+    
+    bool isProcessing   = (PROCTIME) ? check_processing(local_id) : false;
+    bool hasBarrier	= (BARRIER && GlobalParams::hasBarrier[local_id]) ? check_barrier(local_id) : false;
+
+    if( traffic_trace->isEmpty() || isProcessing || isBlocked || hasBarrier)
+        return false;
+
+    Commtrace ct = this->traffic_trace->getComm();
+    
+    if(BARRIER && ct.primitive == MPI_BARRIER){
+		GlobalParams::hasBarrier[local_id] = true;
+		GlobalParams::barrier++;	
+
+		cout << "Sou " << local_id << ". Encontrei a barreira = " << GlobalParams::barrier << endl;
+		
+		return false;
+	}
+    
+    packet.src_id = ct.src;
+    packet.dst_id = ct.dst;
+    packet.timestamp = sc_time_stamp().to_double() / GlobalParams::clock_period_ps;
+
+    packet.ts_start = ct.ts_start;
+    packet.ts_end = ct.ts_end;
+    packet.primitive = ct.primitive; // flit.primitive  packet.primitive;
+
+    int payload = ct.sz;
+    
+    int packet_size = payload + (GlobalParams::traffic_trace_flit_headtail_size);
+    int min_packet_size = GlobalParams::min_packet_size * GlobalParams::flit_size;
+
+    if(packet_size < min_packet_size){
+        int padding = min_packet_size - packet_size;
+        GlobalParams::total_padding += padding;
+        packet.size = packet.flit_left = GlobalParams::min_packet_size;
+    }else
+        packet.size = packet.flit_left = ceil(packet_size/(double) GlobalParams::flit_size);
+
+    GlobalParams::total_payload += payload;
+    GlobalParams::total_headtail += GlobalParams::traffic_trace_flit_headtail_size;
+    GlobalParams::packet_queue[local_id]++;
+
+
+	//~ Packet preview to Proctime, Barrier settings and MPI sendrecv
+    Commtrace preview = this->traffic_trace->viewNextCommTrace();
+
+    //~ Proctime setter
+    if(PROCTIME && !traffic_trace->isEmpty() && GlobalParams::proctime[local_id] == 0){
+        if (packet.primitive != preview.primitive //~ Get only last Timestamp from coletives and bcast
+        || !isCollective(preview.primitive)){  //~ processing if is not collective. Ex: past Send and current Send.
+            assert(preview.ts_start >= packet.ts_end);
+            GlobalParams::proctime[local_id] = preview.ts_start - packet.ts_end;
+        }
+    }   	   
+    return true;
+}
